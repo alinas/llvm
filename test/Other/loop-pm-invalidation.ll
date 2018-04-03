@@ -67,6 +67,7 @@ define void @one_loop(i1* %ptr) {
 ; CHECK-LOOP-INV-NEXT: Running analysis: AssumptionAnalysis
 ; CHECK-LOOP-INV-NEXT: Running pass: LCSSAPass
 ; CHECK-LOOP-INV-NEXT: Finished {{.*}}Function pass manager run
+; CHECK-LOOP-INV-NEXT: Running analysis: MemorySSAAnalysis
 ; CHECK-LOOP-INV-NEXT: Running analysis: AAManager
 ; CHECK-LOOP-INV-NEXT: Running analysis: TargetLibraryAnalysis
 ; CHECK-LOOP-INV-NEXT: Running analysis: ScalarEvolutionAnalysis
@@ -104,6 +105,7 @@ define void @one_loop(i1* %ptr) {
 ; CHECK-SCEV-INV-NEXT: Running analysis: AssumptionAnalysis
 ; CHECK-SCEV-INV-NEXT: Running pass: LCSSAPass
 ; CHECK-SCEV-INV-NEXT: Finished {{.*}}Function pass manager run
+; CHECK-SCEV-INV-NEXT: Running analysis: MemorySSAAnalysis
 ; CHECK-SCEV-INV-NEXT: Running analysis: AAManager
 ; CHECK-SCEV-INV-NEXT: Running analysis: TargetLibraryAnalysis
 ; CHECK-SCEV-INV-NEXT: Running analysis: ScalarEvolutionAnalysis
@@ -151,6 +153,7 @@ define void @nested_loops(i1* %ptr) {
 ; CHECK-LOOP-INV-NEXT: Running analysis: AssumptionAnalysis
 ; CHECK-LOOP-INV-NEXT: Running pass: LCSSAPass
 ; CHECK-LOOP-INV-NEXT: Finished {{.*}}Function pass manager run
+; CHECK-LOOP-INV-NEXT: Running analysis: MemorySSAAnalysis
 ; CHECK-LOOP-INV-NEXT: Running analysis: AAManager
 ; CHECK-LOOP-INV-NEXT: Running analysis: TargetLibraryAnalysis
 ; CHECK-LOOP-INV-NEXT: Running analysis: ScalarEvolutionAnalysis
@@ -197,6 +200,7 @@ define void @nested_loops(i1* %ptr) {
 ; CHECK-SCEV-INV-NEXT: Running analysis: AssumptionAnalysis
 ; CHECK-SCEV-INV-NEXT: Running pass: LCSSAPass
 ; CHECK-SCEV-INV-NEXT: Finished {{.*}}Function pass manager run
+; CHECK-SCEV-INV-NEXT: Running analysis: MemorySSAAnalysis
 ; CHECK-SCEV-INV-NEXT: Running analysis: AAManager
 ; CHECK-SCEV-INV-NEXT: Running analysis: TargetLibraryAnalysis
 ; CHECK-SCEV-INV-NEXT: Running analysis: ScalarEvolutionAnalysis
@@ -260,6 +264,7 @@ define void @dead_loop() {
 ; CHECK-LOOP-INV-NEXT: Running analysis: AssumptionAnalysis
 ; CHECK-LOOP-INV-NEXT: Running pass: LCSSAPass
 ; CHECK-LOOP-INV-NEXT: Finished {{.*}}Function pass manager run
+; CHECK-LOOP-INV-NEXT: Running analysis: MemorySSAAnalysis
 ; CHECK-LOOP-INV-NEXT: Running analysis: AAManager
 ; CHECK-LOOP-INV-NEXT: Running analysis: TargetLibraryAnalysis
 ; CHECK-LOOP-INV-NEXT: Running analysis: ScalarEvolutionAnalysis
@@ -297,6 +302,7 @@ define void @dead_loop() {
 ; CHECK-SCEV-INV-NEXT: Running analysis: AssumptionAnalysis
 ; CHECK-SCEV-INV-NEXT: Running pass: LCSSAPass
 ; CHECK-SCEV-INV-NEXT: Finished {{.*}}Function pass manager run
+; CHECK-SCEV-INV-NEXT: Running analysis: MemorySSAAnalysis
 ; CHECK-SCEV-INV-NEXT: Running analysis: AAManager
 ; CHECK-SCEV-INV-NEXT: Running analysis: TargetLibraryAnalysis
 ; CHECK-SCEV-INV-NEXT: Running analysis: ScalarEvolutionAnalysis
@@ -332,6 +338,7 @@ define void @dead_loop() {
 ; CHECK-SCEV-INV-AFTER-DELETE-NEXT: Running analysis: AssumptionAnalysis
 ; CHECK-SCEV-INV-AFTER-DELETE-NEXT: Running pass: LCSSAPass
 ; CHECK-SCEV-INV-AFTER-DELETE-NEXT: Finished {{.*}}Function pass manager run
+; CHECK-SCEV-INV-AFTER-DELETE-NEXT: Running analysis: MemorySSAAnalysis
 ; CHECK-SCEV-INV-AFTER-DELETE-NEXT: Running analysis: AAManager
 ; CHECK-SCEV-INV-AFTER-DELETE-NEXT: Running analysis: TargetLibraryAnalysis
 ; CHECK-SCEV-INV-AFTER-DELETE-NEXT: Running analysis: ScalarEvolutionAnalysis

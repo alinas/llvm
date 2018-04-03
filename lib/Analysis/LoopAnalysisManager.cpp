@@ -21,7 +21,7 @@ using namespace llvm;
 namespace llvm {
 /// Enables memory ssa as a dependency for loop passes in legacy pass manager.
 cl::opt<bool> EnableMSSALoopDependency(
-    "enable-mssa-loop-dependency", cl::Hidden, cl::init(false),
+    "enable-mssa-loop-dependency", cl::Hidden, cl::init(true),
     cl::desc("Enable MemorySSA dependency for loop pass manager"));
 
 // Explicit template instantiations and specialization definitions for core

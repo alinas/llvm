@@ -463,6 +463,7 @@
 ; CHECK-REPEAT-LOOP-PASS-NEXT: Invalidating all non-preserved analyses
 ; CHECK-REPEAT-LOOP-PASS-NEXT: Running pass: LCSSAPass
 ; CHECK-REPEAT-LOOP-PASS-NEXT: Finished llvm::Function pass manager run
+; CHECK-REPEAT-LOOP-PASS-NEXT: Running analysis: MemorySSAAnalysis
 ; CHECK-REPEAT-LOOP-PASS-NEXT: Running analysis: AAManager
 ; CHECK-REPEAT-LOOP-PASS-NEXT: Running analysis: TargetLibraryAnalysis
 ; CHECK-REPEAT-LOOP-PASS-NEXT: Running analysis: ScalarEvolutionAnalysis

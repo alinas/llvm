@@ -434,8 +434,8 @@ bool llvm::sinkRegion(DomTreeNode *N, AliasAnalysis *AA, LoopInfo *LI,
   assert(N != nullptr && AA != nullptr && LI != nullptr && DT != nullptr &&
          CurLoop != nullptr && SafetyInfo != nullptr &&
          "Unexpected input to sinkRegion.");
-  assert(((CurAST != nullptr) ^ (MSSAU != nullptr)) &&
-         "Either AliasSetTracker or MemorySSA should be initialized.");
+  // assert(((CurAST != nullptr) ^ (MSSAU != nullptr)) &&
+     //    "Either AliasSetTracker or MemorySSA should be initialized.");
 
   // We want to visit children before parents. We will enque all the parents
   // before their children in the worklist and process the worklist in reverse
@@ -504,8 +504,8 @@ bool llvm::hoistRegion(DomTreeNode *N, AliasAnalysis *AA, LoopInfo *LI,
   assert(N != nullptr && AA != nullptr && LI != nullptr && DT != nullptr &&
          CurLoop != nullptr && SafetyInfo != nullptr &&
          "Unexpected input to hoistRegion.");
-  assert(((CurAST != nullptr) ^ (MSSAU != nullptr)) &&
-         "Either AliasSetTracker or MemorySSA should be initialized.");
+  // assert(((CurAST != nullptr) ^ (MSSAU != nullptr)) &&
+     //     "Either AliasSetTracker or MemorySSA should be initialized.");
 
   // We want to visit parents before children. We will enque all the parents
   // before their children in the worklist and process the worklist in order.
@@ -682,7 +682,7 @@ bool isHoistableAndSinkableInst(Instruction &I) {
 /// contain a Mod.
 bool isReadOnly(AliasSetTracker *CurAST, const MemorySSAUpdater *MSSAU,
                 const Loop *L) {
-  if (CurAST) {
+  if (CurAST && !MSSAU) {
     for (AliasSet &AS : *CurAST) {
       if (!AS.isForwardingAliasSet() && AS.isMod()) {
         return false;
@@ -751,7 +751,7 @@ bool llvm::canSinkOrHoistInst(Instruction &I, AAResults *AA, DominatorTree *DT,
       return true;
 
     bool Invalidated;
-    if (CurAST)
+    if (CurAST && !MSSAU)
       Invalidated = pointerInvalidatedByLoop(MemoryLocation::get(LI), CurAST,
                                              CurLoop, AA);
     else
@@ -795,7 +795,7 @@ bool llvm::canSinkOrHoistInst(Instruction &I, AAResults *AA, DominatorTree *DT,
         for (Value *Op : CI->arg_operands())
           if (Op->getType()->isPointerTy()) {
             bool Invalidated;
-            if (CurAST)
+            if (CurAST && !MSSAU)
               Invalidated = pointerInvalidatedByLoop(
                   MemoryLocation(Op, MemoryLocation::UnknownSize, AAMDNodes()),
                   CurAST, CurLoop, AA);
@@ -821,7 +821,7 @@ bool llvm::canSinkOrHoistInst(Instruction &I, AAResults *AA, DominatorTree *DT,
   } else if (auto *FI = dyn_cast<FenceInst>(&I)) {
     // Fences alias (most) everything to provide ordering.  For the moment,
     // just give up if there are any other memory operations in the loop.
-    if (CurAST) {
+    if (CurAST && !MSSAU) {
       auto Begin = CurAST->begin();
       assert(Begin != CurAST->end() && "must contain FI");
       if (std::next(Begin) != CurAST->end())
@@ -849,6 +849,7 @@ bool llvm::canSinkOrHoistInst(Instruction &I, AAResults *AA, DominatorTree *DT,
     // there is exactly one write to the location and that write dominates an
     // arbitrary number of reads in the loop.
     if (CurAST) {
+    //if (CurAST && !MSSAU) {
       auto &AS = CurAST->getAliasSetFor(MemoryLocation::get(SI));
 
       if (AS.isRef() || !AS.isMustAlias())
@@ -1704,7 +1705,8 @@ bool llvm::promoteLoopAccessesToScalars(
     MemoryUse *NewMemUse = cast<MemoryUse>(PreheaderLoadMemoryAccess);
     MSSAU->insertUse(NewMemUse);
     // This is only called to properly update the defining access
-    MSSAU->getMemorySSA()->getWalker()->getClobberingMemoryAccess(NewMemUse);
+    if (EnableLicmCap)
+      MSSAU->getMemorySSA()->getWalker()->getClobberingMemoryAccess(NewMemUse);
   }
 
   // Rewrite all the loads in the loop and remember all the definitions from
@@ -1968,6 +1970,6 @@ static void removeFromAnalyses(Instruction *I, AliasSetTracker *CurAST,
                                MemorySSAUpdater *MSSAU) {
   if (CurAST)
     CurAST->deleteValue(I);
-  else
+  if (MSSAU)
     MSSAU->removeMemoryAccess(I);
 }

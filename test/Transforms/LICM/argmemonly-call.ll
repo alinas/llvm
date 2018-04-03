@@ -93,7 +93,7 @@ declare i32 @foo_new(i32*) readonly
 ; we clump foo_new with bar.
 ; With the N2 Alias analysis diagnostic tool, we are able to hoist the
 ; argmemonly bar call out of the loop.
-; Using MemorySSA we can also hoist bar.
+; Using MemorySSA we can also hoist bar. Test updated with flag flipped.
 
 define void @test5(i32* %loc2, i32* noalias %loc) {
 ; ALIAS-N2-LABEL: @test5
@@ -101,8 +101,8 @@ define void @test5(i32* %loc2, i32* noalias %loc) {
 ; ALIAS-N2-LABEL: loop:
 
 ; CHECK-LABEL: @test5
-; CHECK-LABEL: loop:
 ; CHECK:  @bar
+; CHECK-LABEL: loop:
   br label %loop
 
 loop:
