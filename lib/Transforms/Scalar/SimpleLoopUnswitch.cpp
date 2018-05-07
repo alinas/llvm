@@ -24,6 +24,8 @@
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/LoopIterator.h"
 #include "llvm/Analysis/LoopPass.h"
+#include "llvm/Analysis/MemorySSA.h"
+#include "llvm/Analysis/MemorySSAUpdater.h"
 #include "llvm/Analysis/Utils/Local.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constant.h"
@@ -328,7 +330,8 @@ static void hoistLoopToNewParent(Loop &L, BasicBlock &Preheader,
 /// If `SE` is not null, it will be updated based on the potential loop SCEVs
 /// invalidated by this.
 static bool unswitchTrivialBranch(Loop &L, BranchInst &BI, DominatorTree &DT,
-                                  LoopInfo &LI, ScalarEvolution *SE) {
+                                  LoopInfo &LI, ScalarEvolution *SE,
+                                  MemorySSAUpdater *MSSAU) {
   assert(BI.isConditional() && "Can only unswitch a conditional branch!");
   LLVM_DEBUG(dbgs() << "  Trying to unswitch branch: " << BI << "\n");
 
@@ -402,11 +405,14 @@ static bool unswitchTrivialBranch(Loop &L, BranchInst &BI, DominatorTree &DT,
       SE->forgetTopmostLoop(&L);
   }
 
+  if (MSSAU && VerifyMemorySSA)
+    MSSAU->getMemorySSA()->verifyMemorySSA();
+
   // Split the preheader, so that we know that there is a safe place to insert
   // the conditional branch. We will change the preheader to have a conditional
   // branch on LoopCond.
   BasicBlock *OldPH = L.getLoopPreheader();
-  BasicBlock *NewPH = SplitEdge(OldPH, L.getHeader(), &DT, &LI);
+  BasicBlock *NewPH = SplitEdge(OldPH, L.getHeader(), &DT, &LI, MSSAU);
 
   // Now that we have a place to insert the conditional branch, create a place
   // to branch to: this is the exit block out of the loop that we are
@@ -418,8 +424,12 @@ static bool unswitchTrivialBranch(Loop &L, BranchInst &BI, DominatorTree &DT,
            "A branch's parent isn't a predecessor!");
     UnswitchedBB = LoopExitBB;
   } else {
-    UnswitchedBB = SplitBlock(LoopExitBB, &LoopExitBB->front(), &DT, &LI);
+    UnswitchedBB =
+        SplitBlock(LoopExitBB, &LoopExitBB->front(), &DT, &LI, MSSAU);
   }
+
+  if (MSSAU && VerifyMemorySSA)
+    MSSAU->getMemorySSA()->verifyMemorySSA();
 
   // Actually move the invariant uses into the unswitched position. If possible,
   // we do this by moving the instructions, but when doing partial unswitching
@@ -431,12 +441,17 @@ static bool unswitchTrivialBranch(Loop &L, BranchInst &BI, DominatorTree &DT,
     // its successors.
     OldPH->getInstList().splice(OldPH->end(), BI.getParent()->getInstList(),
                                 BI);
+    if (MSSAU) {
+      // Temporarily clone the terminator, to make MSSA update cheaper by
+      // separating "insert edge" updates from "remove edge" ones.
+      ParentBB->getInstList().push_back(BI.clone());
+    } else {
+      // Create a new unconditional branch that will continue the loop as a new
+      // terminator.
+      BranchInst::Create(ContinueBB, ParentBB);
+    }
     BI.setSuccessor(LoopExitSuccIdx, UnswitchedBB);
     BI.setSuccessor(1 - LoopExitSuccIdx, NewPH);
-
-    // Create a new unconditional branch that will continue the loop as a new
-    // terminator.
-    BranchInst::Create(ContinueBB, ParentBB);
   } else {
     // Only unswitching a subset of inputs to the condition, so we will need to
     // build a new branch that merges the invariant inputs.
@@ -452,19 +467,38 @@ static bool unswitchTrivialBranch(Loop &L, BranchInst &BI, DominatorTree &DT,
                                           *UnswitchedBB, *NewPH);
   }
 
+  // Update the dominator tree with the added edge.
+  DT.insertEdge(OldPH, UnswitchedBB);
+
+  // After the dominator tree was updated with the added edge, update MemorySSA
+  // if available.
+  if (MSSAU) {
+    SmallVector<CFGUpdate, 1> Updates;
+    Updates.push_back({cfg::UpdateKind::Insert, OldPH, UnswitchedBB});
+    MSSAU->applyInsertUpdates(Updates, DT);
+  }
+
+  // Finish updating dominator tree and memory ssa for full unswitch.
+  if (FullUnswitch) {
+    if (MSSAU) {
+      // Remove the cloned branch instruction.
+      ParentBB->getTerminator()->eraseFromParent();
+      // Create unconditional branch now.
+      BranchInst::Create(ContinueBB, ParentBB);
+      MSSAU->removeEdge(ParentBB, LoopExitBB);
+    }
+    DT.deleteEdge(ParentBB, LoopExitBB);
+  }
+
+  if (MSSAU && VerifyMemorySSA)
+    MSSAU->getMemorySSA()->verifyMemorySSA();
+
   // Rewrite the relevant PHI nodes.
   if (UnswitchedBB == LoopExitBB)
     rewritePHINodesForUnswitchedExitBlock(*UnswitchedBB, *ParentBB, *OldPH);
   else
     rewritePHINodesForExitAndUnswitchedBlocks(*LoopExitBB, *UnswitchedBB,
                                               *ParentBB, *OldPH, FullUnswitch);
-
-  // Now we need to update the dominator tree.
-  SmallVector<DominatorTree::UpdateType, 2> DTUpdates;
-  DTUpdates.push_back({DT.Insert, OldPH, UnswitchedBB});
-  if (FullUnswitch)
-    DTUpdates.push_back({DT.Delete, ParentBB, LoopExitBB});
-  DT.applyUpdates(DTUpdates);
 
   // The constant we can replace all of our invariants with inside the loop
   // body. If any of the invariants have a value other than this the loop won't
@@ -516,7 +550,8 @@ static bool unswitchTrivialBranch(Loop &L, BranchInst &BI, DominatorTree &DT,
 /// If `SE` is not null, it will be updated based on the potential loop SCEVs
 /// invalidated by this.
 static bool unswitchTrivialSwitch(Loop &L, SwitchInst &SI, DominatorTree &DT,
-                                  LoopInfo &LI, ScalarEvolution *SE) {
+                                  LoopInfo &LI, ScalarEvolution *SE,
+                                  MemorySSAUpdater *MSSAU) {
   LLVM_DEBUG(dbgs() << "  Trying to unswitch switch: " << SI << "\n");
   Value *LoopCond = SI.getCondition();
 
@@ -542,6 +577,9 @@ static bool unswitchTrivialSwitch(Loop &L, SwitchInst &SI, DominatorTree &DT,
     return false;
 
   LLVM_DEBUG(dbgs() << "    unswitching trivial switch...\n");
+
+  if (MSSAU && VerifyMemorySSA)
+    MSSAU->getMemorySSA()->verifyMemorySSA();
 
   // We may need to invalidate SCEVs for the outermost loop reached by any of
   // the exits.
@@ -605,7 +643,7 @@ static bool unswitchTrivialSwitch(Loop &L, SwitchInst &SI, DominatorTree &DT,
   // Split the preheader, so that we know that there is a safe place to insert
   // the switch.
   BasicBlock *OldPH = L.getLoopPreheader();
-  BasicBlock *NewPH = SplitEdge(OldPH, L.getHeader(), &DT, &LI);
+  BasicBlock *NewPH = SplitEdge(OldPH, L.getHeader(), &DT, &LI, MSSAU);
   OldPH->getTerminator()->eraseFromParent();
 
   // Now add the unswitched switch.
@@ -628,9 +666,10 @@ static bool unswitchTrivialSwitch(Loop &L, SwitchInst &SI, DominatorTree &DT,
       rewritePHINodesForUnswitchedExitBlock(*DefaultExitBB, *ParentBB, *OldPH);
     } else {
       auto *SplitBB =
-          SplitBlock(DefaultExitBB, &DefaultExitBB->front(), &DT, &LI);
-      rewritePHINodesForExitAndUnswitchedBlocks(
-          *DefaultExitBB, *SplitBB, *ParentBB, *OldPH, /*FullUnswitch*/ true);
+          SplitBlock(DefaultExitBB, &DefaultExitBB->front(), &DT, &LI, MSSAU);
+      rewritePHINodesForExitAndUnswitchedBlocks(*DefaultExitBB, *SplitBB,
+                                                *ParentBB, *OldPH,
+                                                /*FullUnswitch*/ true);
       DefaultExitBB = SplitExitBBMap[DefaultExitBB] = SplitBB;
     }
   }
@@ -654,9 +693,10 @@ static bool unswitchTrivialSwitch(Loop &L, SwitchInst &SI, DominatorTree &DT,
     BasicBlock *&SplitExitBB = SplitExitBBMap[ExitBB];
     if (!SplitExitBB) {
       // If this is the first time we see this, do the split and remember it.
-      SplitExitBB = SplitBlock(ExitBB, &ExitBB->front(), &DT, &LI);
-      rewritePHINodesForExitAndUnswitchedBlocks(
-          *ExitBB, *SplitExitBB, *ParentBB, *OldPH, /*FullUnswitch*/ true);
+      SplitExitBB = SplitBlock(ExitBB, &ExitBB->front(), &DT, &LI, MSSAU);
+      rewritePHINodesForExitAndUnswitchedBlocks(*ExitBB, *SplitExitBB,
+                                                *ParentBB, *OldPH,
+                                                /*FullUnswitch*/ true);
     }
     // Update the case pair to point to the split block.
     CasePair.second = SplitExitBB;
@@ -733,6 +773,13 @@ static bool unswitchTrivialSwitch(Loop &L, SwitchInst &SI, DominatorTree &DT,
     DTUpdates.push_back({DT.Insert, OldPH, UnswitchedBB});
   }
   DT.applyUpdates(DTUpdates);
+
+  if (MSSAU) {
+    MSSAU->applyUpdates(DTUpdates, DT);
+    if (VerifyMemorySSA)
+      MSSAU->getMemorySSA()->verifyMemorySSA();
+  }
+
   assert(DT.verify(DominatorTree::VerificationLevel::Fast));
 
   // We may have changed the nesting relationship for this loop so hoist it to
@@ -758,7 +805,8 @@ static bool unswitchTrivialSwitch(Loop &L, SwitchInst &SI, DominatorTree &DT,
 /// If `SE` is not null, it will be updated based on the potential loop SCEVs
 /// invalidated by this.
 static bool unswitchAllTrivialConditions(Loop &L, DominatorTree &DT,
-                                         LoopInfo &LI, ScalarEvolution *SE) {
+                                         LoopInfo &LI, ScalarEvolution *SE,
+                                         MemorySSAUpdater *MSSAU) {
   bool Changed = false;
 
   // If loop header has only one reachable successor we should keep looking for
@@ -792,7 +840,7 @@ static bool unswitchAllTrivialConditions(Loop &L, DominatorTree &DT,
       if (isa<Constant>(SI->getCondition()))
         return Changed;
 
-      if (!unswitchTrivialSwitch(L, *SI, DT, LI, SE))
+      if (!unswitchTrivialSwitch(L, *SI, DT, LI, SE, MSSAU))
         // Couldn't unswitch this one so we're done.
         return Changed;
 
@@ -824,7 +872,7 @@ static bool unswitchAllTrivialConditions(Loop &L, DominatorTree &DT,
 
     // Found a trivial condition candidate: non-foldable conditional branch. If
     // we fail to unswitch this, we can't do anything else that is trivial.
-    if (!unswitchTrivialBranch(L, *BI, DT, LI, SE))
+    if (!unswitchTrivialBranch(L, *BI, DT, LI, SE, MSSAU))
       return Changed;
 
     // Mark that we managed to unswitch something.
@@ -877,7 +925,7 @@ static BasicBlock *buildClonedLoopBlocks(
     const SmallDenseMap<BasicBlock *, BasicBlock *, 16> &DominatingSucc,
     ValueToValueMapTy &VMap,
     SmallVectorImpl<DominatorTree::UpdateType> &DTUpdates, AssumptionCache &AC,
-    DominatorTree &DT, LoopInfo &LI) {
+    DominatorTree &DT, LoopInfo &LI, MemorySSAUpdater *MSSAU) {
   SmallVector<BasicBlock *, 4> NewBlocks;
   NewBlocks.reserve(L.getNumBlocks() + ExitBlocks.size());
 
@@ -922,7 +970,7 @@ static BasicBlock *buildClonedLoopBlocks(
     // place to merge the CFG, so split the exit first. This is always safe to
     // do because there cannot be any non-loop predecessors of a loop exit in
     // loop simplified form.
-    auto *MergeBB = SplitBlock(ExitBB, &ExitBB->front(), &DT, &LI);
+    auto *MergeBB = SplitBlock(ExitBB, &ExitBB->front(), &DT, &LI, MSSAU);
 
     // Rearrange the names to make it easier to write test cases by having the
     // exit block carry the suffix rather than the merge block carrying the
@@ -1353,7 +1401,7 @@ static void buildClonedLoops(Loop &OrigL, ArrayRef<BasicBlock *> ExitBlocks,
 static void
 deleteDeadClonedBlocks(Loop &L, ArrayRef<BasicBlock *> ExitBlocks,
                        ArrayRef<std::unique_ptr<ValueToValueMapTy>> VMaps,
-                       DominatorTree &DT) {
+                       DominatorTree &DT, MemorySSAUpdater *MSSAU) {
   // Find all the dead clones, and remove them from their successors.
   SmallVector<BasicBlock *, 16> DeadBlocks;
   for (BasicBlock *BB : llvm::concat<BasicBlock *const>(L.blocks(), ExitBlocks))
@@ -1365,6 +1413,13 @@ deleteDeadClonedBlocks(Loop &L, ArrayRef<BasicBlock *> ExitBlocks,
           DeadBlocks.push_back(ClonedBB);
         }
 
+  // Remove all MemorySSA in the dead blocks
+  if (MSSAU) {
+    SmallPtrSet<BasicBlock *, 16> DeadBlockSet(DeadBlocks.begin(),
+                                               DeadBlocks.end());
+    MSSAU->removeBlocks(DeadBlockSet);
+  }
+
   // Drop any remaining references to break cycles.
   for (BasicBlock *BB : DeadBlocks)
     BB->dropAllReferences();
@@ -1373,10 +1428,10 @@ deleteDeadClonedBlocks(Loop &L, ArrayRef<BasicBlock *> ExitBlocks,
     BB->eraseFromParent();
 }
 
-static void
-deleteDeadBlocksFromLoop(Loop &L,
-                         SmallVectorImpl<BasicBlock *> &ExitBlocks,
-                         DominatorTree &DT, LoopInfo &LI) {
+static void deleteDeadBlocksFromLoop(Loop &L,
+                                     SmallVectorImpl<BasicBlock *> &ExitBlocks,
+                                     DominatorTree &DT, LoopInfo &LI,
+                                     MemorySSAUpdater *MSSAU) {
   // Find all the dead blocks tied to this loop, and remove them from their
   // successors.
   SmallPtrSet<BasicBlock *, 16> DeadBlockSet;
@@ -1396,6 +1451,10 @@ deleteDeadBlocksFromLoop(Loop &L,
       DeadBlockSet.insert(BB);
     }
   }
+
+  // Remove all MemorySSA in the dead blocks
+  if (MSSAU)
+    MSSAU->removeBlocks(DeadBlockSet);
 
   // Filter out the dead blocks from the exit blocks list so that it can be
   // used in the caller.
@@ -1795,8 +1854,8 @@ void visitDomSubTree(DominatorTree &DT, BasicBlock *BB, CallableT Callable) {
 static bool unswitchNontrivialInvariants(
     Loop &L, TerminatorInst &TI, ArrayRef<Value *> Invariants,
     DominatorTree &DT, LoopInfo &LI, AssumptionCache &AC,
-    function_ref<void(bool, ArrayRef<Loop *>)> UnswitchCB,
-    ScalarEvolution *SE) {
+    function_ref<void(bool, ArrayRef<Loop *>)> UnswitchCB, ScalarEvolution *SE,
+    MemorySSAUpdater *MSSAU) {
   auto *ParentBB = TI.getParent();
   BranchInst *BI = dyn_cast<BranchInst>(&TI);
   SwitchInst *SI = BI ? nullptr : cast<SwitchInst>(&TI);
@@ -1812,6 +1871,9 @@ static bool unswitchNontrivialInvariants(
   else
     assert(isa<Instruction>(BI->getCondition()) &&
            "Partial unswitching requires an instruction as the condition!");
+
+  if (MSSAU && VerifyMemorySSA)
+    MSSAU->getMemorySSA()->verifyMemorySSA();
 
   // Constant and BBs tracking the cloned and continuing successor. When we are
   // unswitching the entire condition, this can just be trivially chosen to
@@ -1864,6 +1926,10 @@ static bool unswitchNontrivialInvariants(
 
   // Compute the parent loop now before we start hacking on things.
   Loop *ParentL = L.getParentLoop();
+  // Get blocks in RPO order for MSSA update, before changing the CFG.
+  LoopBlocksRPO LBRPO(&L);
+  if (MSSAU)
+    LBRPO.perform(&LI);
 
   // Compute the outer-most loop containing one of our exit blocks. This is the
   // furthest up our loopnest which can be mutated, which we will use below to
@@ -1913,7 +1979,7 @@ static bool unswitchNontrivialInvariants(
   // between the unswitched versions, and we will have a new preheader for the
   // original loop.
   BasicBlock *SplitBB = L.getLoopPreheader();
-  BasicBlock *LoopPH = SplitEdge(SplitBB, L.getHeader(), &DT, &LI);
+  BasicBlock *LoopPH = SplitEdge(SplitBB, L.getHeader(), &DT, &LI, MSSAU);
 
   // Keep track of the dominator tree updates needed.
   SmallVector<DominatorTree::UpdateType, 4> DTUpdates;
@@ -1926,7 +1992,7 @@ static bool unswitchNontrivialInvariants(
     VMaps.emplace_back(new ValueToValueMapTy());
     ClonedPHs[SuccBB] = buildClonedLoopBlocks(
         L, LoopPH, SplitBB, ExitBlocks, ParentBB, SuccBB, RetainedSuccBB,
-        DominatingSucc, *VMaps.back(), DTUpdates, AC, DT, LI);
+        DominatingSucc, *VMaps.back(), DTUpdates, AC, DT, LI, MSSAU);
   }
 
   // The stitching of the branched code back together depends on whether we're
@@ -1934,7 +2000,63 @@ static bool unswitchNontrivialInvariants(
   // nuke the initial terminator placed in the split block.
   SplitBB->getTerminator()->eraseFromParent();
   if (FullUnswitch) {
-    // First we need to unhook the successor relationship as we'll be replacing
+    // Splice the terminator from the original loop and rewrite its
+    // successors.
+    SplitBB->getInstList().splice(SplitBB->end(), ParentBB->getInstList(), TI);
+
+    // Keep a clone of the terminator for MSSA updates.
+    Instruction *NewTI = TI.clone();
+    ParentBB->getInstList().push_back(NewTI);
+
+    // First wire up the moved terminator to the preheaders.
+    if (BI) {
+      BasicBlock *ClonedPH = ClonedPHs.begin()->second;
+      BI->setSuccessor(ClonedSucc, ClonedPH);
+      BI->setSuccessor(1 - ClonedSucc, LoopPH);
+      DTUpdates.push_back({DominatorTree::Insert, SplitBB, ClonedPH});
+    } else {
+      assert(SI && "Must either be a branch or switch!");
+
+      // Walk the cases and directly update their successors.
+      assert(SI->getDefaultDest() == RetainedSuccBB &&
+             "Not retaining default successor!");
+      SI->setDefaultDest(LoopPH);
+      for (auto &Case : SI->cases())
+        if (Case.getCaseSuccessor() == RetainedSuccBB)
+          Case.setSuccessor(LoopPH);
+        else
+          Case.setSuccessor(ClonedPHs.find(Case.getCaseSuccessor())->second);
+
+      // We need to use the set to populate domtree updates as even when there
+      // are multiple cases pointing at the same successor we only want to
+      // remove and insert one edge in the domtree.
+      for (BasicBlock *SuccBB : UnswitchedSuccBBs)
+        DTUpdates.push_back(
+            {DominatorTree::Insert, SplitBB, ClonedPHs.find(SuccBB)->second});
+    }
+
+    if (MSSAU) {
+      DT.applyUpdates(DTUpdates);
+      DTUpdates.clear();
+
+      // Remove all but one edge to the retained block and all unswitched
+      // blocks. This is to avoid having duplicate entries in the cloned Phis,
+      // when we know we only keep a single edge for each case.
+      MSSAU->removeDuplicatePhiEdgesBetween(ParentBB, RetainedSuccBB);
+      for (BasicBlock *SuccBB : UnswitchedSuccBBs)
+        MSSAU->removeDuplicatePhiEdgesBetween(ParentBB, SuccBB);
+
+      for (auto &VMap : VMaps)
+        MSSAU->updateForClonedLoop(LBRPO, ExitBlocks, *VMap,
+                                   /*IgnoreIncomingWithNoClones=*/true);
+      MSSAU->updateExitBlocksForClonedLoop(ExitBlocks, VMaps, DT);
+
+      // Remove all edges to unswitched blocks.
+      for (BasicBlock *SuccBB : UnswitchedSuccBBs)
+        MSSAU->removeEdge(ParentBB, SuccBB);
+    }
+
+    // Now unhook the successor relationship as we'll be replacing
     // the terminator with a direct branch. This is much simpler for branches
     // than switches so we handle those first.
     if (BI) {
@@ -1952,9 +2074,10 @@ static bool unswitchNontrivialInvariants(
       // is a duplicate edge to the retained successor as the retained successor
       // is always the default successor and as we'll replace this with a direct
       // branch we no longer need the duplicate entries in the PHI nodes.
-      assert(SI->getDefaultDest() == RetainedSuccBB &&
+      SwitchInst *NewSI = cast<SwitchInst>(NewTI);
+      assert(NewSI->getDefaultDest() == RetainedSuccBB &&
              "Not retaining default successor!");
-      for (auto &Case : SI->cases())
+      for (auto &Case : NewSI->cases())
         Case.getCaseSuccessor()->removePredecessor(
             ParentBB,
             /*DontDeleteUselessPHIs*/ true);
@@ -1966,34 +2089,8 @@ static bool unswitchNontrivialInvariants(
         DTUpdates.push_back({DominatorTree::Delete, ParentBB, SuccBB});
     }
 
-    // Now that we've unhooked the successor relationship, splice the terminator
-    // from the original loop to the split.
-    SplitBB->getInstList().splice(SplitBB->end(), ParentBB->getInstList(), TI);
-
-    // Now wire up the terminator to the preheaders.
-    if (BI) {
-      BasicBlock *ClonedPH = ClonedPHs.begin()->second;
-      BI->setSuccessor(ClonedSucc, ClonedPH);
-      BI->setSuccessor(1 - ClonedSucc, LoopPH);
-      DTUpdates.push_back({DominatorTree::Insert, SplitBB, ClonedPH});
-    } else {
-      assert(SI && "Must either be a branch or switch!");
-
-      // Walk the cases and directly update their successors.
-      SI->setDefaultDest(LoopPH);
-      for (auto &Case : SI->cases())
-        if (Case.getCaseSuccessor() == RetainedSuccBB)
-          Case.setSuccessor(LoopPH);
-        else
-          Case.setSuccessor(ClonedPHs.find(Case.getCaseSuccessor())->second);
-
-      // We need to use the set to populate domtree updates as even when there
-      // are multiple cases pointing at the same successor we only want to
-      // remove and insert one edge in the domtree.
-      for (BasicBlock *SuccBB : UnswitchedSuccBBs)
-        DTUpdates.push_back(
-            {DominatorTree::Insert, SplitBB, ClonedPHs.find(SuccBB)->second});
-    }
+    // After MSSAU update, remove the cloned terminator instruction NewTI.
+    ParentBB->getTerminator()->eraseFromParent();
 
     // Create a new unconditional branch to the continuing block (as opposed to
     // the one cloned).
@@ -2012,12 +2109,19 @@ static bool unswitchNontrivialInvariants(
 
   // Apply the updates accumulated above to get an up-to-date dominator tree.
   DT.applyUpdates(DTUpdates);
+  if (!FullUnswitch && MSSAU) {
+    // Update MSSA for partial unswitch, after DT update.
+    SmallVector<CFGUpdate, 1> Updates;
+    Updates.push_back(
+        {cfg::UpdateKind::Insert, SplitBB, ClonedPHs.begin()->second});
+    MSSAU->applyInsertUpdates(Updates, DT);
+  }
 
   // Now that we have an accurate dominator tree, first delete the dead cloned
   // blocks so that we can accurately build any cloned loops. It is important to
   // not delete the blocks from the original loop yet because we still want to
   // reference the original loop to understand the cloned loop's structure.
-  deleteDeadClonedBlocks(L, ExitBlocks, VMaps, DT);
+  deleteDeadClonedBlocks(L, ExitBlocks, VMaps, DT, MSSAU);
 
   // Build the cloned loop structure itself. This may be substantially
   // different from the original structure due to the simplified CFG. This also
@@ -2029,9 +2133,16 @@ static bool unswitchNontrivialInvariants(
   // Now that our cloned loops have been built, we can update the original loop.
   // First we delete the dead blocks from it and then we rebuild the loop
   // structure taking these deletions into account.
-  deleteDeadBlocksFromLoop(L, ExitBlocks, DT, LI);
+  deleteDeadBlocksFromLoop(L, ExitBlocks, DT, LI, MSSAU);
+
+  if (MSSAU && VerifyMemorySSA)
+    MSSAU->getMemorySSA()->verifyMemorySSA();
+
   SmallVector<Loop *, 4> HoistedLoops;
   bool IsStillLoop = rebuildLoopAfterUnswitch(L, ExitBlocks, LI, HoistedLoops);
+
+  if (MSSAU && VerifyMemorySSA)
+    MSSAU->getMemorySSA()->verifyMemorySSA();
 
   // This transformation has a high risk of corrupting the dominator tree, and
   // the below steps to rebuild loop structures will result in hard to debug
@@ -2144,6 +2255,9 @@ static bool unswitchNontrivialInvariants(
       SibLoops.push_back(UpdatedL);
   UnswitchCB(IsStillLoop, SibLoops);
 
+  if (MSSAU && VerifyMemorySSA)
+    MSSAU->getMemorySSA()->verifyMemorySSA();
+
   ++NumBranches;
   return true;
 }
@@ -2185,7 +2299,7 @@ static bool
 unswitchBestCondition(Loop &L, DominatorTree &DT, LoopInfo &LI,
                       AssumptionCache &AC, TargetTransformInfo &TTI,
                       function_ref<void(bool, ArrayRef<Loop *>)> UnswitchCB,
-                      ScalarEvolution *SE) {
+                      ScalarEvolution *SE, MemorySSAUpdater *MSSAU) {
   // Collect all invariant conditions within this loop (as opposed to an inner
   // loop which would be handled when visiting that inner loop).
   SmallVector<std::pair<TerminatorInst *, TinyPtrVector<Value *>>, 4>
@@ -2377,8 +2491,9 @@ unswitchBestCondition(Loop &L, DominatorTree &DT, LoopInfo &LI,
   LLVM_DEBUG(dbgs() << "  Trying to unswitch non-trivial (cost = "
                     << BestUnswitchCost << ") terminator: " << *BestUnswitchTI
                     << "\n");
-  return unswitchNontrivialInvariants(
-      L, *BestUnswitchTI, BestUnswitchInvariants, DT, LI, AC, UnswitchCB, SE);
+  return unswitchNontrivialInvariants(L, *BestUnswitchTI,
+                                      BestUnswitchInvariants, DT, LI, AC,
+                                      UnswitchCB, SE, MSSAU);
 }
 
 /// Unswitch control flow predicated on loop invariant conditions.
@@ -2390,6 +2505,7 @@ unswitchBestCondition(Loop &L, DominatorTree &DT, LoopInfo &LI,
 ///
 /// The `DT`, `LI`, `AC`, `TTI` parameters are required analyses that are also
 /// updated based on the unswitch.
+/// The `MSSA` analysis is also updated if valid (i.e. its use is enabled).
 ///
 /// If either `NonTrivial` is true or the flag `EnableNonTrivialUnswitch` is
 /// true, we will attempt to do non-trivial unswitching as well as trivial
@@ -2405,7 +2521,7 @@ static bool unswitchLoop(Loop &L, DominatorTree &DT, LoopInfo &LI,
                          AssumptionCache &AC, TargetTransformInfo &TTI,
                          bool NonTrivial,
                          function_ref<void(bool, ArrayRef<Loop *>)> UnswitchCB,
-                         ScalarEvolution *SE) {
+                         ScalarEvolution *SE, MemorySSAUpdater *MSSAU) {
   assert(L.isRecursivelyLCSSAForm(DT, LI) &&
          "Loops must be in LCSSA form before unswitching.");
   bool Changed = false;
@@ -2415,7 +2531,7 @@ static bool unswitchLoop(Loop &L, DominatorTree &DT, LoopInfo &LI,
     return false;
 
   // Try trivial unswitch first before loop over other basic blocks in the loop.
-  if (unswitchAllTrivialConditions(L, DT, LI, SE)) {
+  if (unswitchAllTrivialConditions(L, DT, LI, SE, MSSAU)) {
     // If we unswitched successfully we will want to clean up the loop before
     // processing it further so just mark it as unswitched and return.
     UnswitchCB(/*CurrentLoopValid*/ true, {});
@@ -2436,7 +2552,7 @@ static bool unswitchLoop(Loop &L, DominatorTree &DT, LoopInfo &LI,
 
   // Try to unswitch the best invariant condition. We prefer this full unswitch to
   // a partial unswitch when possible below the threshold.
-  if (unswitchBestCondition(L, DT, LI, AC, TTI, UnswitchCB, SE))
+  if (unswitchBestCondition(L, DT, LI, AC, TTI, UnswitchCB, SE, MSSAU))
     return true;
 
   // No other opportunities to unswitch.
@@ -2470,9 +2586,18 @@ PreservedAnalyses SimpleLoopUnswitchPass::run(Loop &L, LoopAnalysisManager &AM,
       U.markLoopAsDeleted(L, LoopName);
   };
 
+  Optional<MemorySSAUpdater> MSSAU;
+  if (AR.MSSA) {
+    MSSAU = MemorySSAUpdater(AR.MSSA);
+    if (VerifyMemorySSA)
+      AR.MSSA->verifyMemorySSA();
+  }
   if (!unswitchLoop(L, AR.DT, AR.LI, AR.AC, AR.TTI, NonTrivial, UnswitchCB,
-                    &AR.SE))
+                    &AR.SE, MSSAU.hasValue() ? MSSAU.getPointer() : nullptr))
     return PreservedAnalyses::all();
+
+  if (AR.MSSA && VerifyMemorySSA)
+    AR.MSSA->verifyMemorySSA();
 
   // Historically this pass has had issues with the dominator tree so verify it
   // in asserts builds.
@@ -2499,6 +2624,10 @@ public:
   void getAnalysisUsage(AnalysisUsage &AU) const override {
     AU.addRequired<AssumptionCacheTracker>();
     AU.addRequired<TargetTransformInfoWrapperPass>();
+    if (EnableMSSALoopDependency) {
+      AU.addRequired<MemorySSAWrapperPass>();
+      AU.addPreserved<MemorySSAWrapperPass>();
+    }
     getLoopAnalysisUsage(AU);
   }
 };
@@ -2518,6 +2647,12 @@ bool SimpleLoopUnswitchLegacyPass::runOnLoop(Loop *L, LPPassManager &LPM) {
   auto &LI = getAnalysis<LoopInfoWrapperPass>().getLoopInfo();
   auto &AC = getAnalysis<AssumptionCacheTracker>().getAssumptionCache(F);
   auto &TTI = getAnalysis<TargetTransformInfoWrapperPass>().getTTI(F);
+  MemorySSA *MSSA = nullptr;
+  Optional<MemorySSAUpdater> MSSAU;
+  if (EnableMSSALoopDependency) {
+    MSSA = &getAnalysis<MemorySSAWrapperPass>().getMSSA();
+    MSSAU = MemorySSAUpdater(MSSA);
+  }
 
   auto *SEWP = getAnalysisIfAvailable<ScalarEvolutionWrapperPass>();
   auto *SE = SEWP ? &SEWP->getSE() : nullptr;
@@ -2537,7 +2672,14 @@ bool SimpleLoopUnswitchLegacyPass::runOnLoop(Loop *L, LPPassManager &LPM) {
       LPM.markLoopAsDeleted(*L);
   };
 
-  bool Changed = unswitchLoop(*L, DT, LI, AC, TTI, NonTrivial, UnswitchCB, SE);
+  if (MSSA && VerifyMemorySSA)
+    MSSA->verifyMemorySSA();
+
+  bool Changed = unswitchLoop(*L, DT, LI, AC, TTI, NonTrivial, UnswitchCB, SE,
+                              MSSAU.hasValue() ? MSSAU.getPointer() : nullptr);
+
+  if (MSSA && VerifyMemorySSA)
+    MSSA->verifyMemorySSA();
 
   // If anything was unswitched, also clear any cached information about this
   // loop.
@@ -2557,6 +2699,7 @@ INITIALIZE_PASS_DEPENDENCY(AssumptionCacheTracker)
 INITIALIZE_PASS_DEPENDENCY(DominatorTreeWrapperPass)
 INITIALIZE_PASS_DEPENDENCY(LoopInfoWrapperPass)
 INITIALIZE_PASS_DEPENDENCY(LoopPass)
+INITIALIZE_PASS_DEPENDENCY(MemorySSAWrapperPass)
 INITIALIZE_PASS_DEPENDENCY(TargetTransformInfoWrapperPass)
 INITIALIZE_PASS_END(SimpleLoopUnswitchLegacyPass, "simple-loop-unswitch",
                     "Simple unswitch loops", false, false)
