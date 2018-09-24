@@ -346,7 +346,7 @@ LoadAndStorePromoter(ArrayRef<const Instruction *> Insts,
 }
 
 void LoadAndStorePromoter::
-run(const SmallVectorImpl<Instruction *> &Insts) const {
+run(const SmallVectorImpl<Instruction *> &Insts) {
   // First step: bucket up uses of the alloca by the block they occur in.
   // This is important because we have to handle multiple defs/uses in a block
   // ourselves: SSAUpdater is purely for cross-block references.

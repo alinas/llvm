@@ -41,6 +41,7 @@ class BasicBlock;
 class DataLayout;
 class Loop;
 class LoopInfo;
+class MemoryAccess;
 class MemorySSAUpdater;
 class OptimizationRemarkEmitter;
 class PredicatedScalarEvolution;
@@ -151,9 +152,11 @@ void deleteDeadLoop(Loop *L, DominatorTree *DT, ScalarEvolution *SE,
 bool promoteLoopAccessesToScalars(const SmallSetVector<Value *, 8> &,
                                   SmallVectorImpl<BasicBlock *> &,
                                   SmallVectorImpl<Instruction *> &,
+                                  SmallVectorImpl<MemoryAccess *> &,
                                   PredIteratorCache &, LoopInfo *,
                                   DominatorTree *, const TargetLibraryInfo *,
-                                  Loop *, AliasSetTracker *, LoopSafetyInfo *,
+                                  Loop *, AliasSetTracker *,
+                                  MemorySSAUpdater *, LoopSafetyInfo *,
                                   OptimizationRemarkEmitter *);
 
 /// Does a BFS from a given node to all of its children inside a given loop.
